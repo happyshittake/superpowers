@@ -11,10 +11,6 @@ const packageJsonPath = resolve(repoRoot, 'package.json');
 const extensionPath = resolve(repoRoot, '.pi/extensions/superpowers.ts');
 const piToolsPath = resolve(repoRoot, 'skills/using-superpowers/references/pi-tools.md');
 
-async function readPackageJson() {
-  return JSON.parse(await readFile(packageJsonPath, 'utf8'));
-}
-
 async function loadExtension() {
   const handlers = new Map();
   const pi = {
@@ -22,116 +18,98 @@ async function loadExtension() {
       if (!handlers.has(event)) handlers.set(event, []);
       handlers.get(event).push(handler);
     },
+    sendMessage() { assert.fail('bootstrap must not enqueue a provider turn'); },
   };
   const mod = await import(pathToFileURL(extensionPath).href + `?cachebust=${Date.now()}-${Math.random()}`);
   mod.default(pi);
-  return { handlers };
+  const emit = async (event, data = {}) => {
+    for (const handler of handlers.get(event) ?? []) await handler({ type: event, ...data }, {});
+  };
+  return { handlers, emit };
 }
 
-function firstHandler(handlers, event) {
-  const eventHandlers = handlers.get(event) ?? [];
-  assert.equal(eventHandlers.length, 1, `expected one ${event} handler`);
-  return eventHandlers[0];
+function startEvent(messageType = 'user') {
+  return {
+    messageType,
+    systemPrompt: 'Base instructions',
+    systemPromptOptions: { sections: { existing: 'Keep existing instructions' } },
+  };
 }
 
-function textOf(message) {
-  if (typeof message.content === 'string') return message.content;
-  return message.content
-    .filter((part) => part.type === 'text')
-    .map((part) => part.text)
-    .join('\n');
+function bootstrapOf(event) {
+  return event.systemPromptOptions.sections.superpowers_bootstrap;
 }
 
 test('package.json declares a pi package with skills and extension resources', async () => {
-  const pkg = await readPackageJson();
-
+  const pkg = JSON.parse(await readFile(packageJsonPath, 'utf8'));
   assert.equal(pkg.name, 'superpowers');
   assert.ok(pkg.keywords.includes('pi-package'));
   assert.deepEqual(pkg.pi.skills, ['./skills']);
   assert.deepEqual(pkg.pi.extensions, ['./.pi/extensions/superpowers.ts']);
 });
 
-test('extension registers lifecycle hooks without pre-compaction injection', async () => {
-  const { handlers } = await loadExtension();
-
-  for (const event of ['resources_discover', 'session_start', 'session_compact', 'context', 'agent_end']) {
-    assert.equal((handlers.get(event) ?? []).length, 1, `missing ${event} handler`);
-  }
-  assert.equal((handlers.get('session_before_compact') ?? []).length, 0);
-});
-
 test('resources_discover contributes the bundled skills directory', async () => {
   const { handlers } = await loadExtension();
-  const discover = firstHandler(handlers, 'resources_discover');
-
-  const result = await discover({ type: 'resources_discover', cwd: repoRoot, reason: 'startup' }, {});
-
+  const result = await handlers.get('resources_discover')[0]({ type: 'resources_discover', cwd: repoRoot, reason: 'startup' }, {});
   assert.deepEqual(result.skillPaths, [resolve(repoRoot, 'skills')]);
 });
 
-test('startup context injects the bootstrap as one user message until agent_end', async () => {
-  const { handlers } = await loadExtension();
-  const sessionStart = firstHandler(handlers, 'session_start');
-  const context = firstHandler(handlers, 'context');
-  const agentEnd = firstHandler(handlers, 'agent_end');
-
-  await sessionStart({ type: 'session_start', reason: 'startup' }, {});
-
-  const originalMessages = [
-    { role: 'user', content: [{ type: 'text', text: 'Let us make a react todo list' }], timestamp: 1 },
-  ];
-  const result = await context({ type: 'context', messages: originalMessages }, {});
-
-  assert.equal(result.messages.length, 2);
-  assert.equal(result.messages[0].role, 'user');
-  assert.match(textOf(result.messages[0]), /You have superpowers/);
-  assert.match(textOf(result.messages[0]), /Pi tool mapping/);
-  assert.equal(result.messages[1], originalMessages[0]);
-
-  const repeatedProviderRequest = await context({ type: 'context', messages: originalMessages }, {});
-  assert.equal(repeatedProviderRequest.messages.length, 2);
-  assert.match(textOf(repeatedProviderRequest.messages[0]), /You have superpowers/);
-
-  const alreadyInjected = await context({ type: 'context', messages: result.messages }, {});
-  assert.equal(alreadyInjected, undefined, 'bootstrap should not duplicate when already present');
-
-  await agentEnd({ type: 'agent_end', messages: [] }, {});
-  const afterEnd = await context({ type: 'context', messages: originalMessages }, {});
-  assert.equal(afterEnd, undefined, 'startup bootstrap should clear after agent_end');
+test('bootstrap is a structured prompt section without overriding other instructions or queuing messages', async () => {
+  const h = await loadExtension();
+  const event = startEvent();
+  await h.emit('before_agent_start', event);
+  assert.match(bootstrapOf(event), /You have superpowers/);
+  assert.match(bootstrapOf(event), /Pi tool mapping/);
+  assert.match(bootstrapOf(event), /superpowers:using-superpowers bootstrap for pi/);
+  assert.equal(event.systemPromptOptions.sections.existing, 'Keep existing instructions');
+  assert.equal(event.systemPromptOptions.forceSystemPrompt, undefined);
+  assert.equal(event.systemPrompt, 'Base instructions');
 });
 
-test('session_compact injects bootstrap after compaction summaries, not before compaction', async () => {
-  const { handlers } = await loadExtension();
-  const sessionCompact = firstHandler(handlers, 'session_compact');
-  const context = firstHandler(handlers, 'context');
+test('bootstrap remains byte-identical on later prompts after agent_end', async () => {
+  const h = await loadExtension();
+  const first = startEvent();
+  await h.emit('before_agent_start', first);
+  assert.equal(typeof bootstrapOf(first), 'string');
+  await h.emit('agent_end');
+  const second = startEvent();
+  await h.emit('before_agent_start', second);
+  assert.deepEqual(second.systemPromptOptions, first.systemPromptOptions);
+  assert.equal(h.handlers.has('context'), false, 'no temporary message may be inserted or removed from provider context');
+});
 
-  await sessionCompact({ type: 'session_compact', compactionEntry: {}, fromExtension: false }, {});
+test('reload, resume, new sessions and custom-message runs receive the same bootstrap', async () => {
+  const original = startEvent();
+  await (await loadExtension()).emit('before_agent_start', original);
+  assert.equal(typeof bootstrapOf(original), 'string');
+  for (const reason of ['reload', 'resume', 'new', 'fork']) {
+    const h = await loadExtension();
+    await h.emit('session_start', { reason });
+    const next = startEvent('custom');
+    await h.emit('before_agent_start', next);
+    assert.equal(bootstrapOf(next), bootstrapOf(original), reason);
+    await h.emit('before_agent_start', next);
+    assert.equal(bootstrapOf(next), bootstrapOf(original), 'repeated start must not duplicate content');
+  }
+});
 
-  const summary = { role: 'compactionSummary', summary: 'Prior work summary', tokensBefore: 123, timestamp: 1 };
-  const user = { role: 'user', content: [{ type: 'text', text: 'Continue' }], timestamp: 2 };
-  const result = await context({ type: 'context', messages: [summary, user] }, {});
-
-  assert.equal(result.messages.length, 3);
-  assert.equal(result.messages[0], summary);
-  assert.equal(result.messages[1].role, 'user');
-  assert.match(textOf(result.messages[1]), /You have superpowers/);
-  assert.equal(result.messages[2], user);
+test('compaction and tree navigation never inject bootstrap-only turns', async () => {
+  const h = await loadExtension();
+  const first = startEvent();
+  await h.emit('before_agent_start', first);
+  for (const reason of ['manual', 'threshold', 'overflow']) {
+    await h.emit('session_compact', { reason, willRetry: reason === 'overflow' });
+    await h.emit('session_tree');
+    const next = startEvent();
+    await h.emit('before_agent_start', next);
+    assert.deepEqual(next.systemPromptOptions, first.systemPromptOptions);
+  }
 });
 
 test('pi tools reference documents pi-specific mappings', async () => {
   assert.equal(existsSync(piToolsPath), true, 'pi-tools.md should exist');
   const text = await readFile(piToolsPath, 'utf8');
-
-  // Assert against the mapping-table rows only. The surrounding prose mentions
-  // these same tokens, so matching the whole file would still pass if the table
-  // were deleted — the exact regression this test exists to catch.
   const rows = text.split('\n').filter((line) => line.startsWith('|'));
-  assert.ok(
-    rows.some((row) => /subagent/i.test(row)),
-    'mapping table documents subagent dispatch',
-  );
-  assert.ok(
-    rows.some((row) => /todo|task/i.test(row)),
-    'mapping table documents task tracking',
-  );
+  assert.ok(rows.some((row) => /subagent/i.test(row)), 'mapping table documents subagent dispatch');
+  assert.ok(rows.some((row) => /todo|task/i.test(row)), 'mapping table documents task tracking');
 });
